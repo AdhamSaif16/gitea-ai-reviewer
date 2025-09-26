@@ -14,13 +14,31 @@ if not GITEA_TOKEN:
 
 app = FastAPI(title="Gitea AI Reviewer", version="0.1.0")
 
-def sig_ok(secret: str, body: bytes, signature: str | None) -> bool:
-    if not secret:  # allow empty secret for local testing
+def sig_ok(secret: str, body: bytes, headers) -> bool:
+    """Accepts Gitea/Gogs and GitHub signature styles."""
+    if not secret:  # allow unsigned for local testing
         return True
-    if not signature or not signature.startswith("sha256="):
-        return False
-    digest = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest("sha256=" + digest, signature)
+
+    # Gitea/Gogs: X-Gitea-Signature / X-Gogs-Signature (hex; sometimes 'sha256=hex')
+    sig = headers.get("X-Gitea-Signature") or headers.get("X-Gogs-Signature")
+    if sig:
+        sig_hex = sig.split("=", 1)[1] if sig.startswith(("sha256=", "SHA256=")) else sig
+        expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(sig_hex, expected)
+
+    # GitHub style (some proxies/tools reuse): sha256=...
+    sig256 = headers.get("X-Hub-Signature-256")
+    if sig256 and sig256.startswith(("sha256=", "SHA256=")):
+        expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(sig256.split("=", 1)[1], expected)
+
+    # GitHub legacy sha1
+    sig1 = headers.get("X-Hub-Signature")
+    if sig1 and sig1.startswith(("sha1=", "SHA1=")):
+        expected = hmac.new(secret.encode(), body, hashlib.sha1).hexdigest()
+        return hmac.compare_digest(sig1.split("=", 1)[1], expected)
+
+    return False
 
 async def gitea_post(path: str, json: dict):
     headers = {"Authorization": f"token {GITEA_TOKEN}"}
@@ -36,8 +54,9 @@ def health():
 @app.post("/webhooks/gitea")
 async def gitea_webhook(request: Request):
     body = await request.body()
-    signature = request.headers.get("X-Gitea-Signature")
-    if not sig_ok(WEBHOOK_SECRET, body, signature):
+    # OLD: signature = request.headers.get("X-Gitea-Signature")
+    # OLD: if not sig_ok(WEBHOOK_SECRET, body, signature): ...
+    if not sig_ok(WEBHOOK_SECRET, body, request.headers):
         raise HTTPException(status_code=401, detail="invalid signature")
 
     event = request.headers.get("X-Gitea-Event", "")
