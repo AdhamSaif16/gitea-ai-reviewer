@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 import os
 from .llm import review_simple
 import textwrap
+import re
 
 
 load_dotenv()
@@ -17,6 +18,34 @@ if not GITEA_TOKEN:
     raise RuntimeError("GITEA_TOKEN missing")
 
 app = FastAPI(title="Gitea AI Reviewer", version="0.1.0")
+
+async def gitea_post_json(path: str, json: dict | list):
+    headers = {"Authorization": f"token {os.getenv('GITEA_TOKEN','')}"}
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(f"{GITEA_BASE}{path}", headers=headers, json=json)
+        r.raise_for_status()
+        return r.json() if r.headers.get("content-type","").startswith("application/json") else {}
+
+async def ensure_label(owner: str, repo: str, name: str, color: str, desc: str = "") -> dict:
+    # get existing labels
+    labels = await gitea_get(f"/repos/{owner}/{repo}/labels")
+    for lb in labels:
+        if lb.get("name","").lower() == name.lower():
+            return lb
+    # create if missing
+    return await gitea_post_json(
+        f"/repos/{owner}/{repo}/labels",
+        {"name": name, "color": color.lstrip("#"), "description": desc}
+    )
+
+async def add_label_to_issue(owner: str, repo: str, issue_index: int, label_id: int):
+    # Gitea expects a list of label IDs
+    try:
+        await gitea_post_json(f"/repos/{owner}/{repo}/issues/{issue_index}/labels", [label_id])
+    except httpx.HTTPStatusError:
+        # Some versions accept {"labels":[id]} shape — try fallback
+        await gitea_post_json(f"/repos/{owner}/{repo}/issues/{issue_index}/labels", {"labels": [label_id]})
+
 
 # small GET helper for Gitea API
 async def gitea_get(path: str, params: dict | None = None):
@@ -147,6 +176,24 @@ async def gitea_webhook(request: Request):
             )
 
             await gitea_post(f"/repos/{owner}/{name}/issues/{pr_index}/comments", {"body": comment})
+
+            # --- Parse "risk level" from the AI text and label the PR ---
+            risk = "medium"
+            m = re.search(r"risk(?: level)?\s*:\s*(low|medium|high)", ai_text, re.I)
+            if m:
+                risk = m.group(1).lower()
+
+            label_map = {
+                "low":   ("risk: low",    "#2ea043"),
+                "medium":("risk: medium", "#fbca04"),
+                "high":  ("risk: high",   "#d73a4a"),
+            }
+            label_name, label_color = label_map[risk]
+
+            lb = await ensure_label(owner=name and owner or owner, repo=name, name=label_name,
+                                    color=label_color, desc="AI reviewer assessed risk")
+            await add_label_to_issue(owner, name, pr_index, lb["id"])
+
 
             return JSONResponse({"ok": True, "posted": "comment"})
     return JSONResponse({"ok": True, "ignored": event})
