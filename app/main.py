@@ -2,6 +2,10 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 import os, hmac, hashlib, httpx
 from dotenv import load_dotenv
+import os
+from .llm import review_simple
+import textwrap
+
 
 load_dotenv()
 
@@ -13,6 +17,42 @@ if not GITEA_TOKEN:
     raise RuntimeError("GITEA_TOKEN missing")
 
 app = FastAPI(title="Gitea AI Reviewer", version="0.1.0")
+
+# small GET helper for Gitea API
+async def gitea_get(path: str, params: dict | None = None):
+    headers = {"Authorization": f"token {os.getenv('GITEA_TOKEN','')}"}
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(f"{GITEA_BASE}{path}", headers=headers, params=params or {})
+        r.raise_for_status()
+        return r.json()
+
+def _truncate(s: str, max_chars: int = 48000) -> str:
+    return s if len(s) <= max_chars else s[:max_chars] + "\n...[truncated]..."
+
+# build meta + unified diff using /pulls/{index}/files (uses 'patch' field)
+async def fetch_pr_meta_and_diff(owner: str, repo: str, pr_index: int) -> tuple[dict, str]:
+    pr = await gitea_get(f"/repos/{owner}/{repo}/pulls/{pr_index}")
+    files = await gitea_get(f"/repos/{owner}/{repo}/pulls/{pr_index}/files")
+
+    meta = {
+        "owner": owner,
+        "repo": repo,
+        "pr": pr_index,
+        "title": pr.get("title", ""),
+        "body": pr.get("body", "") or "",
+        "files": [f.get("filename","") for f in files or []],
+    }
+
+    # Build a simple unified-style diff from file patches (if present)
+    chunks = []
+    for f in files or []:
+        fn = f.get("filename", "")
+        patch = f.get("patch")
+        if patch:
+            chunks.append(f"diff --git a/{fn} b/{fn}\n{patch}")
+    diff_text = "\n\n".join(chunks) if chunks else ""
+
+    return meta, diff_text
 
 def sig_ok(secret: str, body: bytes, headers) -> bool:
     """Accepts Gitea/Gogs and GitHub signature styles."""
@@ -72,20 +112,41 @@ async def gitea_webhook(request: Request):
             pr = payload["pull_request"]
             pr_index = pr["number"]  # aka issue index
 
-            # Minimal placeholder review (LLM comes next)
-            summary = (
-                f"🤖 AI Reviewer (placeholder)\n"
+            # Build a small prompt from the webhook payload (we'll add diffs next step)
+            title = pr.get("title", "")
+            body = pr.get("body", "") or "(no description)"
+            # Fetch PR context + build prompt with real diff
+            meta, diff_text = await fetch_pr_meta_and_diff(owner, name, pr_index)
+
+            prompt = textwrap.dedent(f"""
+            Review this pull request:
+
+            Repo: {meta['owner']}/{meta['repo']}
+            PR #{meta['pr']}: {meta['title']}
+            Author notes:
+            {meta['body'] or '(no description)'}
+            Files changed ({len(meta['files'])}): {', '.join(meta['files'][:20])}
+
+            Tasks:
+            - Summarize the change in 2–4 bullets.
+            - Flag potential bugs, security or performance risks (reference file/line if possible).
+            - Suggest concrete improvements (short code snippets if helpful).
+            - Give a risk level: Low | Medium | High, with 1-line justification.
+
+            Unified diff:
+            {_truncate(diff_text)}
+            """).strip()
+
+            ai_text = await review_simple(prompt)
+
+            comment = (
+                f"🤖 **AI Reviewer**\n"
                 f"- PR: #{pr_index} in {owner}/{name}\n"
-                f"- Changed files: {pr.get('changed_files', 'n/a')}\n"
-                f"- Next step: enable LLM to generate inline findings."
+                f"- Files: {len(meta['files'])}\n\n"
+                f"{ai_text}"
             )
 
-            # Post a PR comment (PRs are issues in Gitea)
-            try:
-                await gitea_post(f"/repos/{owner}/{name}/issues/{pr_index}/comments", {"body": summary})
-            except httpx.HTTPStatusError as e:
-                # If comment API fails, surface the error for debugging
-                raise HTTPException(status_code=502, detail=e.response.text)
+            await gitea_post(f"/repos/{owner}/{name}/issues/{pr_index}/comments", {"body": comment})
 
             return JSONResponse({"ok": True, "posted": "comment"})
     return JSONResponse({"ok": True, "ignored": event})
