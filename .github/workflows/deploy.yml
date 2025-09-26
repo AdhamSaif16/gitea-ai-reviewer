@@ -1,0 +1,71 @@
+name: Deploy AI Reviewer to EC2
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: SSH and deploy
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          script: |
+            set -euo pipefail
+
+            # 1) Install deps
+            sudo apt-get update -y
+            sudo apt-get install -y git python3-venv
+
+            # 2) Clone or pull latest
+            if [ ! -d /home/ubuntu/gitea-ai-reviewer ]; then
+              git clone https://github.com/${{ github.repository }} /home/ubuntu/gitea-ai-reviewer
+            fi
+            cd /home/ubuntu/gitea-ai-reviewer
+            git fetch --all
+            git checkout -f main
+            git pull --rebase
+
+            # 3) Python env + deps
+            python3 -m venv .venv
+            . .venv/bin/activate
+            pip install -r requirements.txt
+
+            # 4) Write .env from repo secrets
+            cat > .env << 'EOF'
+            GITEA_BASE=${{ secrets.GITEA_BASE }}
+            GITEA_TOKEN=${{ secrets.GITEA_TOKEN }}
+            WEBHOOK_SECRET=${{ secrets.WEBHOOK_SECRET }}
+            OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+            OPENAI_MODEL=${{ secrets.OPENAI_MODEL }}
+            EOF
+
+            # 5) systemd service (creates/updates)
+            sudo bash -c 'cat > /etc/systemd/system/gitea-ai-reviewer.service <<UNIT
+            [Unit]
+            Description=Gitea AI Reviewer
+            After=network.target
+
+            [Service]
+            Type=simple
+            User=ubuntu
+            WorkingDirectory=/home/ubuntu/gitea-ai-reviewer
+            EnvironmentFile=/home/ubuntu/gitea-ai-reviewer/.env
+            ExecStart=/home/ubuntu/gitea-ai-reviewer/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8082
+            Restart=always
+            RestartSec=3
+
+            [Install]
+            WantedBy=multi-user.target
+            UNIT'
+
+            # 6) Restart service and health-check
+            sudo systemctl daemon-reload
+            sudo systemctl enable gitea-ai-reviewer --now
+            sleep 2
+            curl -sSf http://localhost:8082/health || (sudo journalctl -u gitea-ai-reviewer --no-pager -n 100; exit 1)
