@@ -10,7 +10,7 @@ import re
 
 load_dotenv()
 
-GITEA_BASE = os.getenv("GITEA_BASE", "http://3.252.248.64:3000/api/v1").rstrip("/")
+GITEA_BASE = os.getenv("GITEA_BASE", "http://54.229.37.166:3000/api/v1").rstrip("/")
 GITEA_TOKEN = os.getenv("GITEA_TOKEN", "")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # set this in Gitea webhook
 
