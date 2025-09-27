@@ -20,6 +20,24 @@ app = FastAPI(title="Gitea AI Reviewer", version="0.2.0")
 logger = logging.getLogger("ai-reviewer")
 logging.basicConfig(level=logging.INFO)
 
+def _read_secret_file(path: str) -> str | None:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            v = f.read().strip()
+            return v or None
+    except FileNotFoundError:
+        return None
+
+def _get_secret(env_name: str, *file_paths: str) -> str:
+    v = os.getenv(env_name)
+    if v:
+        return v
+    for p in file_paths:
+        v = _read_secret_file(p)
+        if v:
+            return v
+    return ""
+
 
 # ----------------- Gitea helpers -----------------
 
