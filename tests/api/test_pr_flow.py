@@ -19,6 +19,11 @@ def _load_token() -> str:
 TOKEN = _load_token()
 HDRS = {"Authorization": f"token {TOKEN}"}
 
+# Force anyio to use asyncio only (avoid trio dependency)
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
 async def _get(c: httpx.AsyncClient, path: str, **params):
     r = await c.get(f"{GITEA_BASE}{path}", headers=HDRS, params=params)
     r.raise_for_status()
@@ -46,29 +51,52 @@ async def ensure_base_branch(c: httpx.AsyncClient, base_branch: str) -> None:
     except HTTPStatusError as e:
         if e.response.status_code != 404:
             raise
-    # repo is empty or branch missing — create initial README on base_branch
+    # repo empty or branch missing — create initial README on base_branch
     await _put(
         c,
         f"/repos/{OWNER}/{REPO}/contents/README.md",
         {
             "content": b64("# ai-review-demo\n\ninitial commit\n"),
             "message": "chore: initial commit",
-            "branch": base_branch,         # no new_branch here
+            "branch": base_branch,   # no new_branch here
         },
     )
 
-@pytest.mark.anyio("asyncio")  # run only on asyncio backend
-async def test_ai_reviewer_end_to_end():
+async def create_branch(c: httpx.AsyncClient, new_branch: str, from_branch: str) -> None:
+    # Try the branches API first
+    try:
+        await _post(
+            c,
+            f"/repos/{OWNER}/{REPO}/branches",
+            {"new_branch_name": new_branch, "old_branch_name": from_branch},
+        )
+        return
+    except HTTPStatusError as e:
+        # Fallback to git refs API if branches API isn’t available
+        if e.response is None or e.response.status_code not in (404, 422):
+            raise
+    base = await _get(c, f"/repos/{OWNER}/{REPO}/branches/{from_branch}")
+    sha = base["commit"]["id"] if "commit" in base else base["commit"]["sha"]
+    await _post(
+        c,
+        f"/repos/{OWNER}/{REPO}/git/refs",
+        {"ref": f"refs/heads/{new_branch}", "sha": sha},
+    )
+
+@pytest.mark.anyio
+async def test_ai_reviewer_end_to_end(anyio_backend):
     async with httpx.AsyncClient(timeout=30) as c:
+        # discover default branch, ensure it exists
         repo = await _get(c, f"/repos/{OWNER}/{REPO}")
         base_branch = (repo.get("default_branch") or "main").strip()
-
-        # Ensure the base branch exists (create initial commit if needed)
         await ensure_base_branch(c, base_branch)
 
-        # Create a feature branch by committing with new_branch
+        # create a feature branch explicitly (no contents new_branch)
         ts = int(time.time())
         branch = f"e2e-ai-{ts}"
+        await create_branch(c, branch, base_branch)
+
+        # commit a file on the new branch (contents API)
         path = "app/vuln_demo.py"
         code = (
             "import subprocess,re,httpx\n"
@@ -83,16 +111,11 @@ async def test_ai_reviewer_end_to_end():
         commit = await _put(
             c,
             f"/repos/{OWNER}/{REPO}/contents/{path}",
-            {
-                "content": b64(code),
-                "message": f"e2e: add vuln_demo {ts}",
-                "branch": base_branch,
-                "new_branch": branch,
-            },
+            {"content": b64(code), "message": f"e2e: add vuln_demo {ts}", "branch": branch},
         )
         assert commit.get("content", {}).get("path") == path
 
-        # Open the PR
+        # open PR
         pr = await _post(
             c,
             f"/repos/{OWNER}/{REPO}/pulls",
@@ -101,7 +124,7 @@ async def test_ai_reviewer_end_to_end():
         )
         pr_number = pr["number"]
 
-        # Poll for AI comment + risk label (up to 2 minutes)
+        # poll for AI comment + risk label
         comment_found = False
         label_found = False
         deadline = time.time() + 120
