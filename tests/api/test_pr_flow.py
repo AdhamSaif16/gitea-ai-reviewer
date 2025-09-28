@@ -19,7 +19,6 @@ def _load_token() -> str:
 TOKEN = _load_token()
 HDRS = {"Authorization": f"token {TOKEN}"}
 
-# Force anyio to use asyncio backend only
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
@@ -31,7 +30,8 @@ async def _get(c: httpx.AsyncClient, path: str, **params):
 
 async def _post(c: httpx.AsyncClient, path: str, payload: dict):
     r = await c.post(f"{GITEA_BASE}{path}", headers=HDRS, json=payload)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        raise HTTPStatusError(f"{r.status_code} {r.reason_phrase}: {r.text}", request=r.request, response=r)
     return r.json()
 
 async def _put(c: httpx.AsyncClient, path: str, payload: dict):
@@ -44,14 +44,14 @@ def b64(s: str) -> str:
     return base64.b64encode(s.encode("utf-8")).decode("ascii")
 
 async def ensure_base_branch(c: httpx.AsyncClient, base_branch: str) -> None:
-    # ensure base branch exists (create initial commit if needed)
     try:
         await _get(c, f"/repos/{OWNER}/{REPO}/branches/{base_branch}")
         return
     except HTTPStatusError as e:
         if e.response.status_code != 404:
             raise
-    await _put(
+    # repo empty or branch missing — create initial README via POST (create)
+    await _post(
         c,
         f"/repos/{OWNER}/{REPO}/contents/README.md",
         {"content": b64("# ai-review-demo\n\ninitial commit\n"),
@@ -60,7 +60,6 @@ async def ensure_base_branch(c: httpx.AsyncClient, base_branch: str) -> None:
     )
 
 async def create_branch(c: httpx.AsyncClient, new_branch: str, from_branch: str) -> None:
-    # Try branches API
     try:
         await _post(
             c,
@@ -71,16 +70,13 @@ async def create_branch(c: httpx.AsyncClient, new_branch: str, from_branch: str)
     except HTTPStatusError as e:
         if e.response is None or e.response.status_code not in (404, 422):
             raise
-    # Fallback: git refs API
     base = await _get(c, f"/repos/{OWNER}/{REPO}/branches/{from_branch}")
     sha = base["commit"]["id"] if "commit" in base else base["commit"]["sha"]
     await _post(c, f"/repos/{OWNER}/{REPO}/git/refs", {"ref": f"refs/heads/{new_branch}", "sha": sha})
 
 async def get_file_sha(c: httpx.AsyncClient, branch: str, path: str) -> str | None:
-    # returns sha if file exists on branch; otherwise None
     try:
         item = await _get(c, f"/repos/{OWNER}/{REPO}/contents/{path}", ref=branch)
-        # Gitea/GitHub style may use "sha" or nested "content.sha"
         return item.get("sha") or item.get("content", {}).get("sha")
     except HTTPStatusError as e:
         if e.response.status_code == 404:
@@ -90,17 +86,14 @@ async def get_file_sha(c: httpx.AsyncClient, branch: str, path: str) -> str | No
 @pytest.mark.anyio
 async def test_ai_reviewer_end_to_end(anyio_backend):
     async with httpx.AsyncClient(timeout=30) as c:
-        # discover & ensure base branch
         repo = await _get(c, f"/repos/{OWNER}/{REPO}")
         base_branch = (repo.get("default_branch") or "main").strip()
         await ensure_base_branch(c, base_branch)
 
-        # create feature branch
         ts = int(time.time())
         branch = f"e2e-ai-{ts}"
         await create_branch(c, branch, base_branch)
 
-        # commit a file on the new branch (create-or-update with sha if needed)
         path = "app/vuln_demo.py"
         code = (
             "import subprocess,re,httpx\n"
@@ -112,23 +105,26 @@ async def test_ai_reviewer_end_to_end(anyio_backend):
             "        r = await cli.get(url)\n"
             "    return r.status_code\n"
         )
-        payload = {"content": b64(code), "message": f"e2e: add vuln_demo {ts}", "branch": branch}
+
         sha = await get_file_sha(c, branch, path)
+        payload = {"content": b64(code), "message": f"e2e: add vuln_demo {ts}", "branch": branch}
         if sha:
-            payload["sha"] = sha  # update existing file
-        commit = await _put(c, f"/repos/{OWNER}/{REPO}/contents/{path}", payload)
+            payload["sha"] = sha
+            commit = await _put(c, f"/repos/{OWNER}/{REPO}/contents/{path}", payload)   # update
+        else:
+            commit = await _post(c, f"/repos/{OWNER}/{REPO}/contents/{path}", payload)  # create
+
         assert commit.get("content", {}).get("path") == path
 
-        # open PR
         pr = await _post(
             c,
             f"/repos/{OWNER}/{REPO}/pulls",
-            {"title": f"E2E PR {ts}: trigger AI reviewer", "head": branch, "base": base_branch,
+            {"title": f"E2E PR {ts}: trigger AI reviewer",
+             "head": branch, "base": base_branch,
              "body": "Automated e2e test PR to trigger AI review."},
         )
         pr_number = pr["number"]
 
-        # poll for AI comment + risk label
         comment_found = False
         label_found = False
         deadline = time.time() + 120
