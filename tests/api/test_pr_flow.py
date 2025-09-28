@@ -19,7 +19,7 @@ def _load_token() -> str:
 TOKEN = _load_token()
 HDRS = {"Authorization": f"token {TOKEN}"}
 
-# Force anyio to use asyncio only (avoid trio dependency)
+# Force anyio to use asyncio backend only
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
@@ -44,26 +44,23 @@ def b64(s: str) -> str:
     return base64.b64encode(s.encode("utf-8")).decode("ascii")
 
 async def ensure_base_branch(c: httpx.AsyncClient, base_branch: str) -> None:
-    # If branch exists, return; otherwise create initial commit on that branch.
+    # ensure base branch exists (create initial commit if needed)
     try:
         await _get(c, f"/repos/{OWNER}/{REPO}/branches/{base_branch}")
         return
     except HTTPStatusError as e:
         if e.response.status_code != 404:
             raise
-    # repo empty or branch missing — create initial README on base_branch
     await _put(
         c,
         f"/repos/{OWNER}/{REPO}/contents/README.md",
-        {
-            "content": b64("# ai-review-demo\n\ninitial commit\n"),
-            "message": "chore: initial commit",
-            "branch": base_branch,   # no new_branch here
-        },
+        {"content": b64("# ai-review-demo\n\ninitial commit\n"),
+         "message": "chore: initial commit",
+         "branch": base_branch},
     )
 
 async def create_branch(c: httpx.AsyncClient, new_branch: str, from_branch: str) -> None:
-    # Try the branches API first
+    # Try branches API
     try:
         await _post(
             c,
@@ -72,31 +69,38 @@ async def create_branch(c: httpx.AsyncClient, new_branch: str, from_branch: str)
         )
         return
     except HTTPStatusError as e:
-        # Fallback to git refs API if branches API isn’t available
         if e.response is None or e.response.status_code not in (404, 422):
             raise
+    # Fallback: git refs API
     base = await _get(c, f"/repos/{OWNER}/{REPO}/branches/{from_branch}")
     sha = base["commit"]["id"] if "commit" in base else base["commit"]["sha"]
-    await _post(
-        c,
-        f"/repos/{OWNER}/{REPO}/git/refs",
-        {"ref": f"refs/heads/{new_branch}", "sha": sha},
-    )
+    await _post(c, f"/repos/{OWNER}/{REPO}/git/refs", {"ref": f"refs/heads/{new_branch}", "sha": sha})
+
+async def get_file_sha(c: httpx.AsyncClient, branch: str, path: str) -> str | None:
+    # returns sha if file exists on branch; otherwise None
+    try:
+        item = await _get(c, f"/repos/{OWNER}/{REPO}/contents/{path}", ref=branch)
+        # Gitea/GitHub style may use "sha" or nested "content.sha"
+        return item.get("sha") or item.get("content", {}).get("sha")
+    except HTTPStatusError as e:
+        if e.response.status_code == 404:
+            return None
+        raise
 
 @pytest.mark.anyio
 async def test_ai_reviewer_end_to_end(anyio_backend):
     async with httpx.AsyncClient(timeout=30) as c:
-        # discover default branch, ensure it exists
+        # discover & ensure base branch
         repo = await _get(c, f"/repos/{OWNER}/{REPO}")
         base_branch = (repo.get("default_branch") or "main").strip()
         await ensure_base_branch(c, base_branch)
 
-        # create a feature branch explicitly (no contents new_branch)
+        # create feature branch
         ts = int(time.time())
         branch = f"e2e-ai-{ts}"
         await create_branch(c, branch, base_branch)
 
-        # commit a file on the new branch (contents API)
+        # commit a file on the new branch (create-or-update with sha if needed)
         path = "app/vuln_demo.py"
         code = (
             "import subprocess,re,httpx\n"
@@ -108,11 +112,11 @@ async def test_ai_reviewer_end_to_end(anyio_backend):
             "        r = await cli.get(url)\n"
             "    return r.status_code\n"
         )
-        commit = await _put(
-            c,
-            f"/repos/{OWNER}/{REPO}/contents/{path}",
-            {"content": b64(code), "message": f"e2e: add vuln_demo {ts}", "branch": branch},
-        )
+        payload = {"content": b64(code), "message": f"e2e: add vuln_demo {ts}", "branch": branch}
+        sha = await get_file_sha(c, branch, path)
+        if sha:
+            payload["sha"] = sha  # update existing file
+        commit = await _put(c, f"/repos/{OWNER}/{REPO}/contents/{path}", payload)
         assert commit.get("content", {}).get("path") == path
 
         # open PR
